@@ -1,14 +1,13 @@
 # Hi, I'm Jack
 
-## About Me
-- Currently working on a kids planetarium and sensory headphones projects
-- Learning Python
+## Working On
+- Mission Control virtual planetarium
+- Memory Arc MCP claude code session search and manager
+- Vibe reader Firefox Extension
+- pwsh REPL mcp (released)
+- Tunnel Monitor self healing ssh tunnel service for windows (finished, need to release)
+- A bunch of little R projects
+- loraxMod (simple tree sitter implementation for agentic use in powershell, python and javascript)
+- other stuff
 
-## Tech Stack
-- R
-- Python
-- C#
-- Roll20 API (JavaScript)
 
-## GitHub Stats
-![GitHub stats](https://github-readme-stats.vercel.app/api?username=jackyHardDisk&show_icons=true&theme=dark)
