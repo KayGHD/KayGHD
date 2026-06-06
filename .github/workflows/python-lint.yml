@@ -1,0 +1,85 @@
+name: Python Lint (shared)
+
+# Reusable workflow called by each KayGHD Python repo's .github/workflows/lint.yml.
+# Source of truth: KayGHD/.github. Pin callers to a tag (e.g. @v1), not @main.
+# Spec: specs/2026-06-05-shared-python-toolchain.md
+
+on:
+  workflow_call:
+    inputs:
+      python-versions:
+        description: 'JSON list of Python versions to test'
+        required: false
+        type: string
+        default: '["3.12"]'
+      enable-pyright:
+        description: 'Run pyright type check'
+        required: false
+        type: boolean
+        default: true
+      enable-black:
+        description: 'Run black --check'
+        required: false
+        type: boolean
+        default: true
+      enable-ruff:
+        description: 'Run ruff check'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(inputs.python-versions) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      # ruff and black are static — they need only the tool, not the repo's
+      # dependencies — so we install just the tools into a throwaway venv.
+      # The repo's real runtime env (conda) is never touched.
+      - name: Create CI venv
+        run: uv venv .venv-ci --python ${{ matrix.python-version }}
+
+      - name: Install lint tools
+        run: uv pip install --python .venv-ci "ruff>=0.15" "black>=25" "pyright>=1.1"
+
+      # Invoke the tools directly from the throwaway venv. Do NOT use
+      # `uv run` here: it ignores --python for an installed-tool venv and
+      # instead syncs the *project* into a fresh .venv (where these tools
+      # aren't installed), which both fails to find ruff and tries to
+      # resolve the repo's heavy deps for the matrix env.
+      - name: ruff (lint)
+        if: ${{ inputs.enable-ruff }}
+        run: .venv-ci/bin/ruff check .
+
+      - name: black --check
+        if: ${{ inputs.enable-black }}
+        run: .venv-ci/bin/black --check --diff .
+
+      # pyright needs the repo's imports resolvable, so install the package
+      # (+ dev extras) only when pyright is enabled. `|| true` keeps a failed
+      # dependency install (e.g. conda-only deps) from masking the pyright run;
+      # repos with heavy/conda stacks should keep enable-pyright:false and run
+      # pyright locally in their conda env instead.
+      - name: Install repo for pyright
+        if: ${{ inputs.enable-pyright }}
+        run: uv pip install --python .venv-ci -e ".[dev]" || uv pip install --python .venv-ci -e . || true
+
+      - name: pyright
+        if: ${{ inputs.enable-pyright }}
+        run: .venv-ci/bin/pyright
