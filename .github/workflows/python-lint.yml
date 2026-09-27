@@ -1,12 +1,17 @@
 name: Python Lint (shared)
 
-# Reusable workflow called by each KayGHD Python repo's .github/workflows/lint.yml.
-# Source of truth: KayGHD/.github. Pin callers to a tag (e.g. @v1), not @main.
-# Spec: specs/2026-06-05-shared-python-toolchain.md
+# Reusable lint workflow. Pin callers to a tag (e.g. @v2), not @main.
 
 on:
   workflow_call:
     inputs:
+      runs-on:
+        description: >
+          JSON runner label list. The default is a GitHub-hosted runner; pass a
+          self-hosted runner's labels to run there, e.g. '["self-hosted"]'.
+        required: false
+        type: string
+        default: '["ubuntu-latest"]'
       python-versions:
         description: 'JSON list of Python versions to test'
         required: false
@@ -41,7 +46,7 @@ on:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     strategy:
       fail-fast: false
       matrix:

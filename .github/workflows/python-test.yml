@@ -1,0 +1,251 @@
+name: Python Test (shared)
+
+# Reusable test workflow. Pin callers to a tag (e.g. @v2), not @main.
+#
+# Contract (v2): the repo commits a current uv.lock, and its `dev` extra holds
+# pytest, pytest-cov and pyright. The job installs nothing outside the lock
+# except the `host-matched` packages, which must match a library on the host.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: >
+          JSON runner label list. The default is a GitHub-hosted runner; pass a
+          self-hosted runner's labels to run there, e.g. '["self-hosted"]'.
+        required: false
+        type: string
+        default: '["ubuntu-latest"]'
+      python-version:
+        description: 'Single Python version for this call'
+        required: false
+        type: string
+        default: '3.12'
+      extras:
+        description: 'Comma-separated extras for uv sync --locked --extra ...'
+        required: false
+        type: string
+        default: 'dev'
+      private-deps:
+        description: >
+          Comma-separated names of private repositories (same owner as the
+          caller) the GitHub App token may read, for private git dependencies.
+          Empty skips the token step entirely.
+        required: false
+        type: string
+        default: ''
+      pytest-args:
+        description: >
+          Appended verbatim to pytest. A -m here REPLACES the repo's addopts -m,
+          so restate the repo's own exclusion inside the expression.
+        required: false
+        type: string
+        default: ''
+      gpu-lock:
+        description: 'Wrap pytest in the host GPU lock (self-hosted GPU runners only)'
+        required: false
+        type: boolean
+        default: false
+      coverage:
+        description: 'Measure coverage and enforce the repo fail_under floor'
+        required: false
+        type: boolean
+        default: true
+      pyright-ratchet:
+        description: 'Fail when the pyright error count rises above .pyright-baseline.json'
+        required: false
+        type: boolean
+        default: true
+      timeout-minutes:
+        description: 'Job timeout; must exceed the 30 min lock wait plus the suite'
+        required: false
+        type: number
+        default: 90
+      host-matched:
+        description: >
+          Comma-separated pkg=cmd pairs (e.g. 'gdal=gdal-config --version'):
+          pkg is skipped by uv sync and installed as pkg==$(cmd) afterwards.
+        required: false
+        type: string
+        default: ''
+    secrets:
+      CI_APP_ID:
+        required: false
+      CI_APP_PRIVATE_KEY:
+        required: false
+
+jobs:
+  test:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    env:
+      # Pin the interpreter: on a self-hosted runner the managed-Python store is
+      # shared by every job of the runner's user.
+      UV_PYTHON: ${{ inputs.python-version }}
+      UV_PYTHON_PREFERENCE: only-managed
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          # Self-hosted runners keep uv's cache on the host.
+          enable-cache: ${{ !contains(inputs.runs-on, 'self-hosted') }}
+          # Keyed on pyproject.toml, which always exists: setup-uv fails hard on
+          # a glob that matches nothing, and a missing uv.lock must fail at
+          # `uv sync --locked` with uv's own message, not here.
+          cache-dependency-glob: '**/pyproject.toml'
+
+      - name: Set up Python ${{ inputs.python-version }}
+        run: uv python install "${{ inputs.python-version }}"
+
+      - name: App token for private git dependencies
+        id: app-token
+        if: ${{ inputs.private-deps != '' }}
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ inputs.private-deps }}
+
+      # --locked (never the frozen mode): it fails when uv.lock is missing or no
+      # longer matches pyproject.toml, where the frozen mode installs it stale.
+      - name: uv sync (locked)
+        env:
+          GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          EXTRAS: ${{ inputs.extras }}
+          HOST_MATCHED: ${{ inputs.host-matched }}
+        run: |
+          args=()
+          IFS=',' read -ra extras <<<"$EXTRAS"
+          for e in "${extras[@]}"; do
+            e=$(echo "$e" | xargs)
+            [[ -n "$e" ]] && args+=(--extra "$e")
+          done
+          IFS=',' read -ra pairs <<<"$HOST_MATCHED"
+          for p in "${pairs[@]}"; do
+            pkg=$(echo "${p%%=*}" | xargs)
+            [[ -n "$pkg" ]] && args+=(--no-install-package "$pkg")
+          done
+          if [[ -n "$GH_APP_TOKEN" ]]; then
+            # Process-scoped credential helper: nothing is written to ~/.gitconfig.
+            export GIT_CONFIG_COUNT=1
+            export GIT_CONFIG_KEY_0=credential.helper
+            export GIT_CONFIG_VALUE_0='!f() { echo username=x-access-token; echo "password=$GH_APP_TOKEN"; }; f'
+          fi
+          echo "uv sync --locked ${args[*]}"
+          uv sync --locked "${args[@]}"
+
+      - name: Host-matched installs
+        if: ${{ inputs.host-matched != '' }}
+        env:
+          HOST_MATCHED: ${{ inputs.host-matched }}
+        run: |
+          IFS=',' read -ra pairs <<<"$HOST_MATCHED"
+          for p in "${pairs[@]}"; do
+            pkg=$(echo "${p%%=*}" | xargs)
+            cmd=${p#*=}
+            want=$(bash -c "$cmd")
+            echo "host-matched: $pkg==$want (from: $cmd)"
+            uv pip install --python .venv/bin/python "$pkg==$want"
+            got=$(.venv/bin/python -c 'import importlib.metadata as m, sys; print(m.version(sys.argv[1]))' "$pkg")
+            echo "host-matched: installed $pkg $got"
+            if [[ "$got" != "$want" ]]; then
+              echo "::error::host-matched $pkg installed $got, host reports $want"
+              exit 1
+            fi
+          done
+
+      # Ratchet: the error count may fall, never rise. CI never writes the
+      # baseline; a fall is reported so the PR author lowers it.
+      - name: pyright ratchet
+        if: ${{ inputs.pyright-ratchet }}
+        run: |
+          if [[ ! -x .venv/bin/pyright ]]; then
+            echo "::error::pyright is not installed in the job venv: add pyright>=1.1 to [project.optional-dependencies] dev and re-lock"
+            exit 1
+          fi
+          .venv/bin/pyright --pythonpath .venv/bin/python --outputjson > pyright.json || true
+          errors=$(jq -e '.summary.errorCount' pyright.json) || {
+            echo "::error::pyright produced no summary; see pyright.json"
+            exit 1
+          }
+          if [[ ! -f .pyright-baseline.json ]]; then
+            echo "::error::no .pyright-baseline.json: create it with {\"errors\": $errors}"
+            exit 1
+          fi
+          base=$(jq -e '.errors' .pyright-baseline.json)
+          line="pyright errors: $errors (baseline $base)"
+          if (( errors > base )); then
+            echo "::error::pyright errors rose $base→$errors"
+            echo "$line — rose" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if (( errors < base )); then
+            line="pyright errors fell $base→$errors; lower \`.pyright-baseline.json\` to $errors in this PR."
+          fi
+          echo "$line"
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: pytest
+        env:
+          COVERAGE: ${{ inputs.coverage }}
+          GPU_LOCK: ${{ inputs.gpu-lock }}
+        run: |
+          cov_args=()
+          if [[ "$COVERAGE" == true ]]; then
+            if ! .venv/bin/python -c 'import pytest_cov' 2>/dev/null; then
+              echo "::error::pytest-cov is not installed in the job venv: add pytest-cov to [project.optional-dependencies] dev and re-lock"
+              exit 1
+            fi
+            # The floor is the repo's own [tool.coverage.report] fail_under,
+            # which pytest-cov enforces; the workflow never passes its own.
+            cov_args=(--cov --cov-report=json:coverage.json --cov-report=term-missing:skip-covered)
+          fi
+          if [[ "$GPU_LOCK" != true ]]; then
+            .venv/bin/pytest "${cov_args[@]}" ${{ inputs.pytest-args }}
+            exit
+          fi
+          # The host GPU lock, shared with every other GPU user on the host.
+          LOCK=/tmp/gpu-queue.lock
+          exec 9>>"$LOCK"                       # O_APPEND: never truncate a holder's pid stamp while waiting
+          if ! flock -w 1800 9; then
+            holder="$(tr -d ' \n' <"$LOCK")"
+            echo "::error::GPU lock $LOCK still held after 1800 s by ${holder:-an unidentified process}"
+            exit 75
+          fi
+          truncate -s 0 "$LOCK"; printf '%-16s' "$$" >&9   # stamp our pid, 16 wide, as other lock holders do
+          trap 'truncate -s 0 "$LOCK"' EXIT                # clear the stamp on every exit, a red pytest included
+          export GPU_QUEUE_LOCK_HELD="$LOCK${GPU_QUEUE_LOCK_HELD:+:$GPU_QUEUE_LOCK_HELD}"
+          nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader
+          .venv/bin/pytest "${cov_args[@]}" ${{ inputs.pytest-args }} 9>&-   # pytest does NOT inherit the locked fd
+
+      - name: Coverage summary
+        if: ${{ always() && inputs.coverage }}
+        run: |
+          if [[ ! -f coverage.json ]]; then
+            echo "no coverage.json (pytest did not reach the report)"
+            exit 0
+          fi
+          floor=$(.venv/bin/python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb")).get("tool", {}).get("coverage", {}).get("report", {}).get("fail_under", "none"))')
+          {
+            echo "### Coverage"
+            echo
+            printf 'Total: %.1f%% (floor: %s)\n\n' "$(jq '.totals.percent_covered' coverage.json)" "$floor"
+            echo "| File | Covered |"
+            echo "|---|---|"
+            jq -r '.files | to_entries | sort_by(.value.summary.percent_covered) | .[:10][]
+              | "| \(.key) | \(.value.summary.percent_covered | floor)% |"' coverage.json
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage and pyright reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: |
+            coverage.json
+            pyright.json
+          retention-days: 14
+          if-no-files-found: ignore
