@@ -96,6 +96,14 @@ jobs:
           # `uv sync --locked` with uv's own message, not here.
           cache-dependency-glob: '**/pyproject.toml'
 
+      # setup-uv points UV_CACHE_DIR at the job's temp dir, which the runner
+      # wipes after every job; on a self-hosted runner keep the cache in the
+      # runner user's home so each job's fresh venv is hardlinked from a warm
+      # cache instead of re-downloading every wheel.
+      - name: Persistent uv cache (self-hosted)
+        if: ${{ contains(inputs.runs-on, 'self-hosted') }}
+        run: echo "UV_CACHE_DIR=$HOME/.cache/uv" >> "$GITHUB_ENV"
+
       - name: Set up Python ${{ inputs.python-version }}
         run: uv python install "${{ inputs.python-version }}"
 
