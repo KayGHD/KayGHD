@@ -57,8 +57,17 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v4
         with:
-          enable-cache: true
+          # Self-hosted runners keep uv's cache on the host.
+          enable-cache: ${{ !contains(inputs.runs-on, 'self-hosted') }}
           cache-dependency-glob: ${{ inputs.cache-dependency-glob }}
+
+      # setup-uv points UV_CACHE_DIR at the job's temp dir, which the runner
+      # wipes after every job; on a self-hosted runner keep the cache in the
+      # runner user's home so the lint tools install from it instead of
+      # re-downloading every run.
+      - name: Persistent uv cache (self-hosted)
+        if: ${{ contains(inputs.runs-on, 'self-hosted') }}
+        run: echo "UV_CACHE_DIR=$HOME/.cache/uv" >> "$GITHUB_ENV"
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
