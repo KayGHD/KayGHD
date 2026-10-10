@@ -215,19 +215,26 @@ jobs:
             .venv/bin/pytest "${cov_args[@]}" ${{ inputs.pytest-args }}
             exit
           fi
-          # The host GPU lock, shared with every other GPU user on the host.
-          LOCK=/tmp/gpu-queue.lock
-          exec 9>>"$LOCK"                       # O_APPEND: never truncate a holder's pid stamp while waiting
-          if ! flock -w 1800 9; then
-            holder="$(tr -d ' \n' <"$LOCK")"
-            echo "::error::GPU lock $LOCK still held after 1800 s by ${holder:-an unidentified process}"
-            exit 75
+          # The host GPU lock (/tmp/gpu-queue.lock), shared with every other GPU user on the
+          # host, taken through the host's FIFO queue so this run holds a ticket: a daemon that
+          # holds the lock between jobs hands it over only to a ticketed waiter, and a bare
+          # flock would wait out the whole timeout behind it. The queue stamps our pid in the
+          # lock, exports GPU_QUEUE_LOCK_HELD, keeps the locked fd from pytest, and exits 75
+          # naming the holder on timeout. The host publishes the script; without it the run
+          # fails rather than take the lock blind.
+          Q=/opt/gpu-run-serialization/gpu_queue.sh
+          if [[ ! -x "$Q" ]]; then
+            echo "::error::$Q not found: gpu-lock: true needs the host's GPU queue script"
+            exit 1
           fi
-          truncate -s 0 "$LOCK"; printf '%-16s' "$$" >&9   # stamp our pid, 16 wide, as other lock holders do
-          trap 'truncate -s 0 "$LOCK"' EXIT                # clear the stamp on every exit, a red pytest included
-          export GPU_QUEUE_LOCK_HELD="$LOCK${GPU_QUEUE_LOCK_HELD:+:$GPU_QUEUE_LOCK_HELD}"
-          nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader
-          .venv/bin/pytest "${cov_args[@]}" ${{ inputs.pytest-args }} 9>&-   # pytest does NOT inherit the locked fd
+          rc=0
+          "$Q" run -w 1800 -- sh -c \
+            'nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader; exec "$@"' sh \
+            .venv/bin/pytest "${cov_args[@]}" ${{ inputs.pytest-args }} || rc=$?
+          if [[ $rc -eq 75 ]]; then
+            echo "::error::GPU lock /tmp/gpu-queue.lock still held after 1800 s (holder in the gpu_queue line above)"
+          fi
+          exit "$rc"
 
       - name: Coverage summary
         if: ${{ always() && inputs.coverage }}
